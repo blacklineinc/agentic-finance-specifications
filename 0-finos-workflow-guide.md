@@ -1608,7 +1608,7 @@ A conforming implementation:
 The complete workflow definition below models a 12-edge DAG. It classifies an invoice with an
 A2A agent, enriches it with vendor data from the ERP, evaluates a spending-limit policy, routes
 escalations through one or two tiers of human review depending on amount, and posts the approval
-back to the ERP.
+back to the ERP with a REST `POST` call.
 
 It exercises six of the nine node types: `FinOSStart`, `FinOSAgent`, `FinOSAPI`, `FinOSPolicy`,
 `FinOSHITL`, and `FinOSTerminal`.
@@ -1637,11 +1637,16 @@ CFO Approval (FinOSHITL — 48h escalation to cfo-backup)
     │ e-09-cfo-approve  [decision == "APPROVED"]  → ERP Poster
     │ e-10-cfo-reject   [decision == "REJECTED"]  → Terminal (Rejected)
 
-ERP Poster (FinOSAgent)
+ERP Poster (FinOSAPI — POST)
     │ e-11-post-to-terminal  [unconditional]
     ▼
 Terminal (Approved) — exitStatus: COMPLETED
 ```
+
+The ERP Poster is a `FinOSAPI` node, not a `FinOSAgent`. No agent performs a mutation: agents
+read and recommend, and every write to a system of record is a deterministic API call. Here the
+`POST` runs only after the spending policy has approved the invoice, or after the human reviewers
+have approved an escalation.
 
 Both terminals carry `exitStatus: COMPLETED`: a rejected invoice is a valid business outcome,
 not a workflow failure. `FAILED` is reserved for a workflow that could not proceed — escalation
@@ -1711,7 +1716,7 @@ workflowId:      wf-invoice-approval-v1
 #  [spending-policy] (FinOSPolicy)
 #       ├── outcome == ESCALATE  → [manager-review] (FinOSHITL)
 #       │       ├── decision == APPROVED and amount >= 50000 → [cfo-approval] (FinOSHITL)
-#       │       │       ├── decision == APPROVED → [post-approval] (FinOSAgent)
+#       │       │       ├── decision == APPROVED → [post-approval] (FinOSAPI — POST)
 #       │       │       │       │ (unconditional) → [terminal-completed]
 #       │       │       └── decision == REJECTED → [terminal-rejected]
 #       │       ├── decision == APPROVED and amount < 50000  → [post-approval]
@@ -1721,8 +1726,8 @@ workflowId:      wf-invoice-approval-v1
 #
 # NODE TYPES DEMONSTRATED:
 #   FinOSStart    — Explicit workflow entry point (REQUIRED, exactly one, per DAG)
-#   FinOSAgent    — A2A agent invocation
-#   FinOSAPI      — REST API call
+#   FinOSAgent    — A2A agent invocation (reads and recommends; never mutates)
+#   FinOSAPI      — REST API call (GET reads vendor data; POST writes the approval)
 #   FinOSHITL     — Human-in-the-loop gate
 #   FinOSPolicy   — Policy evaluation
 #   FinOSTerminal — Explicit workflow terminal (REQUIRED in every DAG)
@@ -1838,16 +1843,27 @@ nodes:
       assignedRole: cfo-backup
     timeoutSeconds: 0
 
-  # ── Step 5: Post approval to ERP (FinOSAgent) ───────────────────────────
+  # ── Step 5: Post approval to ERP (FinOSAPI — POST) ──────────────────────
+  # The only mutation in the workflow. It is a deterministic REST call, never
+  # an agent: no FinOSAgent may perform a mutation. The Idempotency-Key header
+  # makes retries safe, so a retried POST cannot post the approval twice.
   - nodeId: post-approval
-    nodeType: FinOSAgent
+    nodeType: FinOSAPI
     name: "ERP Poster"
-    agentId: agt-erp-poster-001
-    taskInputTemplate:
-      invoice_id: "${ .invoice_id }"
-      approval_status: "APPROVED"
-    outputMapping:
-      erp_confirmation_id: "${ .confirmationId }"
+    endpoint: "${ .erp_base_url + \"/invoices/\" + .invoice_id + \"/approvals\" }"
+    httpMethod: POST
+    requestHeaders:
+      Content-Type: "application/json"
+      X-Tenant-Id: "${ .tenant_id }"
+      Idempotency-Key: "${ .invoice_id + \"-approval\" }"
+    requestBody:
+      invoiceId: "${ .invoice_id }"
+      approvalStatus: "APPROVED"
+      amount: "${ .invoice_amount }"
+      vendorId: "${ .vendor_id }"
+      classification: "${ .classification }"
+    responseMapping:
+      erp_confirmation_id: "${ .body.confirmationId }"
     timeoutSeconds: 30
     retryPolicy:
       maxRetries: 3
